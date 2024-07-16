@@ -1,26 +1,129 @@
-from nada_dsl import *
+import asyncio
+import py_nillion_client as nillion
+import os
 
+from py_nillion_client import NodeKey, UserKey
+from dotenv import load_dotenv
+from nillion_python_helpers import get_quote_and_pay, create_nillion_client, create_payments_config
 
-def nada_main():
-    # Define parties
-    alice = Party(name="Alice")
-    bob = Party(name="Bob")
-    charlie = Party(name="Charlie")
+from cosmpy.aerial.client import LedgerClient
+from cosmpy.aerial.wallet import LocalWallet
+from cosmpy.crypto.keypairs import PrivateKey
 
-    # Define secret bids from each party
-    alice_bid = SecretInteger(Input(name="alice_bid", party=alice))
-    bob_bid = SecretInteger(Input(name="bob_bid", party=bob))
-    charlie_bid = SecretInteger(Input(name="charlie_bid", party=charlie))
+def setup_environment():
+    home = os.getenv("HOME")
+    load_dotenv(f"{home}/.config/nillion/nillion-devnet.env")
 
-    # Determine the maximum bid
-    alice_has_max_bid = (alice_bid > bob_bid) and (alice_bid > charlie_bid)
-    bob_has_max_bid = (bob_bid > alice_bid) and (bob_bid > charlie_bid)
-    charlie_has_max_bid = (charlie_bid > alice_bid) and (charlie_bid > bob_bid)
+async def main():
+    setup_environment()
 
-    # Combine conditions using logical OR
-    max_bid = alice_has_max_bid or bob_has_max_bid or charlie_has_max_bid
+    cluster_id = os.getenv("NILLION_CLUSTER_ID")
+    grpc_endpoint = os.getenv("NILLION_NILCHAIN_GRPC")
+    chain_id = os.getenv("NILLION_NILCHAIN_CHAIN_ID")
 
-    # Output the result
-    max_bid_output = Output(max_bid, "max_bid", alice)
+    seed = "my_seed"
+    userkey = UserKey.from_seed(seed)
+    nodekey = NodeKey.from_seed(seed)
+    client = create_nillion_client(userkey, nodekey)
 
-    return [max_bid_output]
+    payments_config = create_payments_config(chain_id, grpc_endpoint)
+    payments_client = LedgerClient(payments_config)
+    payments_wallet = LocalWallet(
+        PrivateKey(bytes.fromhex(os.getenv("NILLION_NILCHAIN_PRIVATE_KEY_0"))),
+        prefix="nillion",
+    )
+
+    program_name = "main"
+    program_mir_path = f"../nada_quickstart_programs/target/{program_name}.nada.bin"
+
+    receipt_store_program = await get_quote_and_pay(
+        client,
+        nillion.Operation.store_program(program_mir_path),
+        payments_wallet,
+        payments_client,
+        cluster_id,
+    )
+    action_id = await client.store_program(
+        cluster_id, program_name, program_mir_path, receipt_store_program
+    )
+    print("Stored program. action_id:", action_id)
+
+    nr_borrowers = 3
+    nr_lenders = 3
+    secrets = {}
+
+    loan_requests = [
+        (1000, 5),
+        (1500, 7),
+        (2000, 6)
+    ]
+    
+    loan_offers = [
+        (1000, 4),
+        (2000, 6),
+        (1500, 5)
+    ]
+
+    for b in range(nr_borrowers):
+        loan_amount, max_interest_rate = loan_requests[b]
+        secrets[f"loan_amount_Borrower{b}"] = nillion.SecretUnsignedInteger(loan_amount)
+        secrets[f"max_interest_rate_Borrower{b}"] = nillion.SecretUnsignedInteger(max_interest_rate)
+    
+    for l in range(nr_lenders):
+        offer_amount, interest_rate = loan_offers[l]
+        secrets[f"offer_amount_Lender{l}"] = nillion.SecretUnsignedInteger(offer_amount)
+        secrets[f"interest_rate_Lender{l}"] = nillion.SecretUnsignedInteger(interest_rate)
+      
+    new_secret = nillion.NadaValues(secrets)
+
+    receipt_store = await get_quote_and_pay(
+        client,
+        nillion.Operation.store_values(new_secret, ttl_days=5),
+        payments_wallet,
+        payments_client,
+        cluster_id,
+    )
+
+    permissions = nillion.Permissions.default_for_user(client.user_id)
+    permissions.add_compute_permissions({client.user_id: {f"{client.user_id}/{program_name}"}})
+
+    store_id = await client.store_values(
+        cluster_id, new_secret, permissions, receipt_store
+    )
+    print(f"Stored secrets. Store ID: {store_id}")
+
+    compute_bindings = nillion.ProgramBindings(f"{client.user_id}/{program_name}")
+
+    for b in range(nr_borrowers):
+        compute_bindings.add_input_party(f"Borrower{b}", client.party_id)
+
+    for l in range(2, nr_lenders):
+         compute_bindings.add_input_party(f"Lender{l}", client.party_id)
+
+    compute_bindings.add_output_party("OutParty", client.party_id)
+
+    receipt_compute = await get_quote_and_pay(
+        client,
+        nillion.Operation.compute(f"{client.user_id}/{program_name}", nillion.NadaValues({})),
+        payments_wallet,
+        payments_client,
+        cluster_id,
+    )
+    compute_id = await client.compute(
+        cluster_id,
+        compute_bindings,
+        [store_id],
+        nillion.NadaValues({}),
+        receipt_compute
+    )
+    print(f"Computation initiated. Compute ID: {compute_id}")
+
+    while True:
+        compute_event = await client.next_compute_event()
+        if isinstance(compute_event, nillion.ComputeFinishedEvent) and compute_event.uuid == compute_id:
+            print(f"✅ Compute complete for compute_id {compute_event.uuid}")
+            print(f"🖥️ The result is {compute_event.result.value}")
+            return compute_event.result.value
+
+if __name__ == "__main__":
+    asyncio.run(main())
